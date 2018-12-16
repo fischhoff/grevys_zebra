@@ -1,0 +1,391 @@
+---
+title: "grevy’s_zebra"
+author: "Ilya"
+date: "12/15/2018"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Mapping preferred habitat of Grevy's zebra
+
+##Objective: Map habitat quality for Grevy's zebra based on radiocollar and remote sensing data. 
+
+##Background
+Grevy's zebra are critically endangered. Grevy's zebra depend on the rangelands of Northern Kenya. To prioritize conservation interventions in this area, it is important to identify the environmental features preferred by Grevy's zebra. We expect land cover, woody biomass, and livestock density to be important influences on the locations chosen by Grevy's zebra. Land cover affects forage availability for Grevy's zebra, which are primarily grazers while also infrequently browsing. Woody biomass, in addition to affecting forage, is a proxy for visibility, which drives predation danger. Livestock represent competition and human activity.  
+
+##Strategy
+Assemble and integrate Grevy's zebra GPS radiocollar and environmental data. Generate "false" Grevy's zebra locations by drawing random moves from observed distributions of step lengths and turning angles. Use machine learning (generalized boosted models) to identify environmental features that predict whether a Grevy's zebra location is true (observed locations) or false. Use model to map habitat suitability based on environmental features.       
+
+##Data sources
+###Grevy's zebra GPS collar locations
+###Environmental data
+####Global land cover dataset (European Space Agency)
+####Woody biomass dataset (Bouvet et al.)
+####Livestock density (Food and Agriculture Organization)
+
+##Study design
+
+####install packages needed for study
+```{r}
+# pkgTest is a helper function to load packages and install packages only when they are not installed yet.
+pkgTest <- function(x)
+{
+  if (x %in% rownames(installed.packages()) == FALSE) {
+    install.packages(x, dependencies= TRUE)    
+  }
+  library(x, character.only = TRUE)
+}
+neededPackages <- c("raster", "rgdal", "dplyr", "lubridate", "ggplot2",  "geojsonio", 
+                    "tmaptools", "geojson", "stplanr", "sf", "tidyverse", "amt", "tibble", "survival", "sp", "lubridate" ,
+                    "MuMIn", "lme4", "gamm4", "lmerTest", "ggplot2", "onehot", "scales")
+
+for (package in neededPackages){pkgTest(package)}
+
+
+```
+
+###Read in and merge Grevy's zebra GPS radiocollar data.
+
+###GZT 2006-2008
+####read in collar data 2006-2007 from GZT
+```{r}
+#need path name to match data organization  
+path <- "GZ collar data/GZ-Collar-Data-2006-2007"
+#get list of file names
+fns <- list.files(path)
+#find the files that have .shp extension
+shps <- fns[grepl(".shp", fns)]
+#find the locations files (vs. tracks)
+shps <- shps[grepl("locations", shps)]
+#remove the xml files
+shps.xml <- shps[grepl(".xml", shps)]
+shps <- setdiff(shps, shps.xml)
+
+#check merge locations file to see what's in it
+m <- shapefile(paste(path, "/", "merge_locations.shp", sep = ""))
+m.df = data.frame(m)
+unique(m$COLLAR_ID)
+
+#get list of shpfiles w/o merge file
+shps.original = setdiff(shps, "merge_locations.shp")
+#get names of zebras 
+id.names <- sapply(strsplit(shps.original, "_"), `[`, 1)
+#get chronofile name of ids
+chrono.names <- sapply(strsplit(shps.original, "_"), `[`, 2)
+out = NULL
+
+for (a in 1:length(shps.original)){
+  print(a)
+  #read in shapefile
+  tmp <- shapefile(paste(path, "/", shps.original[a], sep = ""))
+  #make into dataframe from shapefile
+  tmp<- data.frame(tmp)
+  #make names lower case
+  names(tmp)<- tolower(names(tmp))
+  #assign zebra name
+  tmp$id <- id.names[a]
+  #assign chronofile.chk (to be checked against chronofile field)
+  tmp$chronofile.chk <-chrono.names[a]
+  #add records to out
+  out = rbind(out, tmp)
+}
+#confirm that data read into "out"" have same number of rows as in merge file
+print(dim(out)[1])==print(dim(m.df)[1])#
+
+#confirm chronofile matches chronofile.chk
+print(unique(out$chronofile==out$chronofile.chk))
+m0607 <- out
+save(m0607,file="m0607.Rdata") 
+```
+
+####get summary (metadata) of 06-07 data 
+```{r}
+load("m0607.Rdata")
+
+m0607$date = as.Date(m0607$fixtime, "%Y/%m/%d")
+m0607sum <- m0607 %>% 
+  group_by(id) %>%
+    summarise(
+    first.date.GZT = min(date),
+    last.date.GZT = max(date),
+    count.GZT = n(),
+    collar_id = collar_id[1],
+    chronofile = chronofile[1])
+print(m0607sum)
+m0607sum = data.frame(m0607sum)
+save(m0607sum, file = "m0607sum.Rdata") 
+```
+
+####Integrate three sources of metadata for 2006-2008 and add info to location data.
+GZT 2006-2007 data have date but not time of day. 
+Read in collar data 2006-2007 from MBB thesis files; these actually go into 2008. 
+Merge metadata extracted from GZT version (m0607sum), with metadata extracted from MBB thesis files (m0606MBBsum), and metadata from Henrik's report (H). 
+Add metadata from Henrik report to location data (m0608MBB)
+```{r}
+load("m0607sum.Rdata")
+path <- "Michael/MBB_Thesis/MBB_SCRIPTS/Zebra_csv"
+
+m0608MBB <- read.csv(paste(path, "/", "master.csv", sep = ""))
+
+m0608MBB$name = m0608MBB$id
+m0608MBB$Fixtime = as.character(m0608MBB$Fixtime)
+m0608MBB$Fixtime <- strptime(m0608MBB$Fixtime, format = "%m/%d/%Y %H:%M", tz = "Africa/Nairobi")
+#now get strftime which can be used to get min
+m0608MBB$Fixtime <-strftime(m0608MBB$Fixtime)
+
+#MBB data on Silurian are missing from "master", so read those in separately
+silurian = "silurian.txt"
+sil = read.csv(silurian)
+sil$id = "Silurian"
+sil$name = "Silurian"
+sil$Fixtime <- strptime(sil$Fixtime, format = "%m/%d/%Y %H:%M", tz = "Africa/Nairobi")
+#now get strftime which can be used to get min
+sil$Fixtime <-strftime(sil$Fixtime)
+
+int.col = intersect(names(sil), names(m0608MBB))
+sil = sil[,int.col]
+setdiff(names(m0608MBB), names(sil))
+setdiff(names(sil), names(m0608MBB))
+m0608MBB = rbind(m0608MBB, sil)
+
+#MBB data on jeff are missing from "master", so read those in separately
+jeff = "jeff.csv"
+jeff = read.csv(jeff)
+jeff$id = "Jeff"
+jeff$name = "Jeff"
+jeff$Fixtime <- strptime(jeff$Fixtime, format = "%m/%d/%Y %H:%M", tz = "Africa/Nairobi")
+#now get strftime which can be used to get min
+jeff$Fixtime <-strftime(jeff$Fixtime)
+int.col = intersect(names(jeff), names(m0608MBB))
+jeff = jeff[,int.col]
+setdiff(names(m0608MBB), names(jeff))
+setdiff(names(jeff), names(m0608MBB))
+m0608MBB = rbind(m0608MBB, jeff)
+
+m0608MBBsum <- m0608MBB %>% 
+  group_by(id) %>%
+    summarise(
+    collar_id = collar_id[1],
+    chronofile = Chronofile[1],
+      first.date.MBB = min(Fixtime),
+    last.date.MBB = max(Fixtime),
+    count.MBB = n()
+    )
+m0608MBBsum = data.frame(m0608MBBsum)
+m0608MBBsum = m0608MBBsum[order(m0608MBBsum$collar_id),]
+print(m0608MBBsum)#seems to be missing Silurian
+
+#put together m0607sum and m0608MBBsum
+intersect(names(m0607sum), names(m0608MBBsum))
+setdiff(m0607sum$id, m0608MBBsum$id)
+setdiff( m0608MBBsum$id, m0607sum$id)
+m0607sum$id[m0607sum$id=="njeri"]="Njeri"
+#assume that Silurian = Silurian1
+m0608MBBsum$id = as.character(m0608MBBsum$id)
+m0608MBBsum$id[m0608MBBsum$id=="Silurian"]="Silurian1"
+m0608GZT_MBB = merge(m0607sum, m0608MBBsum)
+m0608GZT_MBB$first.data.match = m0608GZT_MBB$first.date.GZT==m0608GZT_MBB$first.date.MBB#all except belind match, and that is only two days off
+m0608GZT_MBB$count.MBB>m0608GZT_MBB$count.GZT#check that there are always more data in MBB files -- all TRUE
+
+#now read in metadata from Henrik
+H = read.csv("metadata_STE_06_07_Henrik.csv", blank.lines.skip = TRUE)
+H = subset(H, GZ.ID.final!="")
+names(H)[names(H)=="Serial.No."]="collar_id"
+names(H)[names(H)=="GZ.ID.final"]="id"
+H$id = as.character(H$id)
+H$id[H$id == "Silurian"]="Silurian1"
+setdiff(H$id, m0608GZT_MBB$id)#Laisamis2 -- active, not reporting
+setdiff(m0608GZT_MBB$id, H$id)
+
+Martha = subset(m0608GZT_MBB,id=="Martha")#makes sense that Martha would be missing from Henrik because it was put on after Henrik's report (made in March '07)
+
+Samburu2 = subset(m0608GZT_MBB,id=="Samburu2")#Samburu2 also put on after Henrik's report 
+#take certain fields from Henrik
+keep.col= c("id", "collar_id","place", "Area.Name", "Sex", "Age..yrs.")
+H = H[,keep.col]
+#add rows in Henrik dataset for Martha and Samburu2
+tmp = data.frame(id = "Martha",
+                 collar_id = "T5H-1529",
+                 place = "unknown",
+                 Area.Name = "unknown",
+              Sex = "F",
+              Age..yrs. = "unknown")
+H = rbind(H, tmp)
+tmp = data.frame(id = "Samburu2",
+                 collar_id = "T5H-1429",
+                 place = "unknown",
+                 Area.Name = "unknown",
+              Sex = "unknown",
+              Age..yrs. = "unknown")
+H = rbind(H, tmp)
+
+#merge H with m0608GZT_MBB
+m0608GZT_MBB_H = merge(m0608GZT_MBB, H)
+#save metadata file
+keep.col = c("id", "collar_id", "chronofile", "place", "Area.Name", "Sex", "Age..yrs.")
+m0608GZT_MBB_H = m0608GZT_MBB_H[,keep.col]
+
+intersect(names(m0608MBB), names(m0608GZT_MBB_H))
+#change Silurian to Silurian1 in m0608MBB
+m0608MBB$id = as.character(m0608MBB$id)
+m0608MBB$id[m0608MBB$id == "Silurian"]="Silurian1"
+m0608_locs = merge(m0608MBB, H)
+dim(m0608MBB)[1]==dim(m0608_locs)[1]#should be TRUE and it is 
+setdiff(unique(m0608MBB$id), unique(m0608_locs$id))#should be empty
+setdiff(unique(m0608GZT_MBB_H$id), unique(m0608_locs$id))#should be empty
+
+save(m0608_locs, file = "m0608_locs.Rdata")
+write.csv(m0608_locs, file = "GZ_2006_2008.csv")
+```
+
+###2011-2014 data
+####Read in collar data from 2011 to 2013 (output: z11_13)
+```{r}
+path <- "GZ collar data/"
+z11_13 = read.csv(file =paste(path,"Collar data from Jan 2011_Dec 2013_PL.csv", sep =""))
+z11_13$datetime = strptime(z11_13$acquisitiontime, format = "%d/%m/%Y %H:%M:%S", tz = "Africa/Nairobi")
+#now get strftime which can be used to get min
+z11_13$datetime <-strftime(z11_13$datetime)
+save(z11_13, file = "z11_13.Rdata")
+#z11_13$collar_id = z11_13$collarid
+z11_13sum <- z11_13 %>%
+  group_by(collarid) %>%
+      summarise(
+    first.date = min(datetime),
+    last.date = max(datetime),
+    count = n())
+
+#get list of file names, for shapefiles that may overlap with z11_13
+fns <- list.files(path)
+#find the files that have .shp extension
+shps <- fns[grepl(".shp", fns)]
+#find the files w/ "11Sep2012"
+shps <- shps[grepl("11Sep2012", shps)]
+out= NULL
+for (a in 1:length(shps)){
+  #read in shapefile
+  tmp <- shapefile(paste(path, "/", shps[a], sep = ""))
+  #make into dataframe from shapefile
+  tmp<- data.frame(tmp)
+  #make names lower case
+  names(tmp)<- tolower(names(tmp))
+  #assign zebra name
+#  tmp$id <- id.names[a]
+  #assign chronofile.chk (to be checked against chronofile field)
+#  tmp$chronofile.chk <-chrono.names[a]
+  #add records to out
+  out = rbind(out, tmp)
+}
+#summarize out
+out$datetime <- strptime(out$datetime, format = "%Y-%m-%d %H:%M:%S", tz = "Africa/Nairobi")
+#now get strftime which can be used to get min
+out$datetime <-strftime(out$datetime)
+
+out1 <-out %>% 
+  group_by(collarid) %>%
+    summarise(
+    first.date.sep = min(datetime),
+    last.date.sep = max(datetime),
+    count = n())
+
+#merge z11_13sum and out1
+z11_13sum$collarid = as.character(z11_13sum$collarid)
+intersect(names(z11_13sum), names(out1))
+intersect(unique(out1$collarid), unique(z11_13sum$collarid))
+z11_13_out1 = merge(z11_13sum, out1, by = "collarid")
+head(z11_13_out1)
+#confirmed that separate shapefiles (out) are subset of data in z11_13
+```
+
+###Combine all GZT data
+####Merge '06-'08 and '11-'14 data
+Read in metadata for 2010-2014 data, merge with z11_13. 
+Output: Z.Rdata
+```{r}
+#load 0608 data and change field names to match up with names in metadata for '10-'14
+load("m0608_locs.Rdata")
+names(m0608_locs)=tolower(names(m0608_locs))
+names(m0608_locs)[names(m0608_locs)=="area.name"]="location.collared"
+names(m0608_locs)[names(m0608_locs)=="fixtime"]="datetime"
+m0608_locs$repro.status.at.collaring = NA
+keep = c("id", "collar_id", "datetime", "lon", "lat", "height", "temp", "location.collared", "sex", "age..yrs.", "repro.status.at.collaring")
+m0608_locs = m0608_locs[,keep]
+names(m0608_locs)
+#load '11-'13 data
+load("z11_13.Rdata")
+names(z11_13)[names(z11_13)=="collarid"]="collar_id"
+names(z11_13)[names(z11_13)=="latitude"]="lat"
+names(z11_13)[names(z11_13)=="longitude"]="lon"
+names(z11_13)[names(z11_13)=="altitude"]="height"
+names(z11_13)[names(z11_13)=="temperature"]="temp"
+z11_13$id = z11_13$collar_id#id will be the same as collar_id
+z11_13$age..yrs. = NA
+names(z11_13)
+keep = c("id", "collar_id", "datetime", "lon", "lat", "height", "temp", "age..yrs.")
+z11_13 = z11_13[,keep]
+#left off here 20180427 -need to merge z11_13 with zmeta10_14, then merge with other dataset
+#read in metadata for '11-'13
+path <- "GZ collar data/"
+zmeta_10_14 = read.csv(file = paste(path,"GZ Collar Tracking List July 2014.csv", sep = ""))
+names(zmeta_10_14)
+head(zmeta_10_14)
+names(zmeta_10_14) =tolower(names(zmeta_10_14))
+names(zmeta_10_14)[names(zmeta_10_14)=="unit.id"]= "collar_id"
+names(zmeta_10_14)[names(zmeta_10_14)=="gz.class.collared"]= "repro.status.at.collaring"
+unique(zmeta_10_14$gz.class.collared)#all are female
+zmeta_10_14$sex = "F"
+names(zmeta_10_14)
+keep = c("collar_id", "location.collared", "repro.status.at.collaring", "sex")
+zmeta_10_14 = zmeta_10_14[,keep]#keep only some columns in metadata
+zmeta_10_14$collar_id = tolower(zmeta_10_14$collar_id)#make collar_id lower case
+intersect(names(z11_13), names(zmeta_10_14))
+z11_13 = merge(z11_13, zmeta_10_14)
+
+setdiff(names(m0608_locs), names(z11_13))#confirm there are no differences in columns
+setdiff(names(z11_13),names(m0608_locs))
+intersect(unique(z11_13$collar_id), unique(m0608_locs$collar_id))#confirm there are no ids in common
+
+intersect(names(z11_13), names(m0608_locs))#check names in common
+
+Z = rbind(m0608_locs, z11_13)
+save(Z, file = "Z.Rdata")
+write.csv(Z, file = "GZcollar_06_13.csv")
+
+```
+
+####Summarize collar data
+summary: date range, location collared, sample size
+```{r}
+library(dplyr)
+load("Z.Rdata")
+
+Zsum <- Z %>%
+  group_by(id) %>%
+  summarise(min.datetime = min(datetime),
+            max.datetime = max(datetime),
+            location.collared = location.collared[1],
+            count = n())
+
+Zsum = data.frame(Zsum)
+Zsum = Zsum[order(Zsum$max.datetime),]
+Zsum
+write.csv(Zsum, file = "Z.summary.csv")
+```
+
+###Clean GZ data
+#Subset by bounding coordinates -- 
+
+
+
+###Read in and merge environmental data. 
+###Generate false Grevy's zebra locations. 
+###Assign environmental data to true and false Grevy's zebra locations. 
+
+##Analysis
+###Define generalized boosted model to predict true vs. false. 
+###Split Grevy's zebra data into training and test sets
+###Fit model and determine training and test accuracy. 
+###Predict habitat suitability across landscape by applying fitted model to map of environmental features.  
