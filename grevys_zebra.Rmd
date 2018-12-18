@@ -376,13 +376,375 @@ write.csv(Zsum, file = "Z.summary.csv")
 ```
 
 ###Clean GZ data
-#Subset by bounding coordinates -- 
+####Subset by bounding coordinates matching range of GZ in Kenya.
+This removes implausible points. 
+```{r}
+load("Z.Rdata")
 
+df = Z
+proj  = "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+xy <- cbind(df$lon,df$lat)#package sp
 
+df <-SpatialPointsDataFrame(coords = xy, data = df,
+                            proj4string = CRS(proj))
+
+m <- raster("GZ_2010_AGB_watermask_byte_LZW.tif")
+
+projection(m)==projection(df)#check this is true
+dim(df)
+ZCrop <- raster::crop(df, m)
+dim(ZCrop)
+
+Z = ZCrop
+save(Z, file = "Z.Rdata")
+```
 
 ###Read in and merge environmental data. 
+
 ###Generate false Grevy's zebra locations. 
+Apply amt package to zebra data
+```{r}
+max_speed = 30#executive decision: cannot go faster than 30 km per hour
+#following this vignette: https://cran.r-project.org/web/packages/amt/vignettes/p4_SSF.html
+load("Z.Rdata")
+nrand =1#number of randomly selected moves chosen
+Z$datetime =parse_date_time(Z$datetime,  "YmdHMS")
+
+head(Z$datetime)
+ids = unique(Z$id)
+a = 1#counter
+out = NULL
+real = NULL
+for (a in 1:length(ids)){#start for loop through ids
+  print(a)
+  z_tmp = subset(Z, id == ids[a])
+  z_tmp = z_tmp[!duplicated(z_tmp$datetime),]#remove duplicate datetimes
+
+  #get one row
+  z_tmp1 = z_tmp[1,]
+  z_tmp <- mk_track(z_tmp, lon, lat, datetime, id = id)
+  #this makes a data.frame
+  
+  #add burst field
+  z_tmp<-z_tmp %>%
+    mutate(burst_ = 1)
+  #change to tibble
+  z_tmp = as_tibble(z_tmp)
+  #change to bursts
+  z_tmp <- steps_by_burst(z_tmp, lonlat=TRUE)
+  speed = rep(NA, dim(z_tmp)[1])
+  speed= 60*(z_tmp$sl_/as.numeric(z_tmp$t2_-z_tmp$t1_)/1000)
+  z_tmp$speed = speed 
+  z_tmp = subset(z_tmp, speed<max_speed)
+  #now get bursts again
+  z_tmp <- z_tmp %>%
+    mutate(x_ = x1_,
+           y_ = y1_,
+           t_ = t1_)
+  
+  z_tmp= z_tmp[,c("x_","y_", "t_")]
+  z_tmp <- mk_track(z_tmp, x_, y_, t_)
+  #this makes a data.frame
+    #add burst field
+  z_tmp<-z_tmp %>%
+    mutate(burst_ = 1)
+
+  #change to tibble
+  z_tmp = as_tibble(z_tmp)
+  #change to bursts
+  z_tmp <- steps_by_burst(z_tmp, lonlat=TRUE)
+
+  z_tmp_real = z_tmp
+  z_tmp_real$id = as.character(ids[a])
+  real = rbind(real, z_tmp_real)
+  #get random steps
+  z_tmp <- random_steps(z_tmp, n = nrand)
+  #add id field
+  z_tmp$id = as.character(ids[a])
+  out = rbind(out, z_tmp)
+}
+head(z_tmp)
+
+out=data.frame(out)
+out_false = subset(out, case_ == FALSE)
+#https://stackoverflow.com/questions/7477003/calculating-new-longitude-latitude-from-old-n-meters
+r_earth = 6371000.0 
+out_false$new_latitude  = out_false$y1_  + (out_false$y2_ / r_earth) * (180 / pi)
+
+out_false$new_longitude = out_false$x1_ + (out_false$x2_ / r_earth) * (180 / pi) / cos(out_false$y1_ * pi/180);
+#check: https://www.nhc.noaa.gov/gccalc.shtml
+
+#TRUE moves already have x2, y2 as new longitude, new latitude
+out_true = subset(out, case_ == TRUE)
+out_true$new_latitude = out_true$y2_
+out_true$new_longitude = out_true$x2_
+
+out = rbind(out_false, out_true)
+out$datetime = parse_date_time(out$t1,  "YmdHMS")
+
+#rename new_longitude as location-long to match format in movebank
+names(out)[names(out)=="new_longitude"]="location-long"#use location they went to
+names(out)[names(out)=="new_latitude"]="location-lat"
+names(out)[names(out)=="t2_"]="timestamp"
+#change time stamp to include fraction of second -- did this to use movebank environmental data annotation for generic data. but that has max size 100,000 rows. so commenting out as unnecessary and in case it causes problems reading into regular movebank. 
+out$timestamp = as.character(out$timestamp)
+# out$timestamp=paste(out$timestamp,".001", sep = "")
+out$timestamp <- strptime(out$timestamp, "%Y-%m-%d %H:%M:%OS")#for some reason using strptime and then strftime works
+out$timestamp <- strftime(out$timestamp, "%Y-%m-%d %H:%M:%OS", usetz=FALSE)
+head(out$timestamp)
+
+out = out[,c("case_", 
+              "id","location-long",
+             "location-lat",
+             "timestamp",
+             "sl_",
+             "ta_",
+             "dt_")]
+unique(out$id)
+out_init = subset(out, id == ids[1])
+out_rest = subset(out, id != ids[1])
+write.csv(out_init, file = "out_init.csv")
+write.csv(out_rest, file = "out_rest.csv")
+save(out, file = "out.Rdata")
+
+#work out cutoff based on horses canter top speed = ~30 km/hr
+real = subset(out, case_ == "TRUE")
+speed = rep(NA, dim(real)[1])
+speed = 60*(real$sl_/as.numeric(real$dt)/1000)
+real$speed = speed
+save(real, file = "real.Rdata")
+write.csv(real, file = "Zreal.csv")
+h = hist(real$speed, plot = FALSE, breaks = 200)
+
+
+```
+
+####Land cover
+Read in Africa land cover map and subset for Kenya. Source: http://2016africalandcover20m.esrin.esa.int/
+```{r}
+path = "ESACCI-LC-L4-LC10-Map-20m-P1Y-2016-v1.0/"
+esa <- raster(paste0(path,"ESACCI-LC-L4-LC10-Map-20m-P1Y-2016-v1.0.tif"))
+
+#source: http://thematicmapping.org/downloads/world_borders.php
+path = "TM_WORLD_BORDERS-0.3/"
+countries = shapefile(paste0(path,"TM_WORLD_BORDERS-0.3.shp"))
+
+kenya = subset(countries, NAME=="Kenya")
+proj <- projection(kenya)
+
+esa_kenya = crop(esa, kenya)
+plot(esa_kenya)
+writeRaster(esa_kenya, "esa_kenya.tif", format="GTiff",
+            overwrite=TRUE)
+
+```
+
+
+####Woody biomass
+Read in woody biomass dataset (source: Bouvet et al.) and ESA land cover and put them together. Result: r_comb.tif
+```{r woody_esa}
+m <- raster("GZ_2010_AGB_watermask_byte_LZW.tif")
+
+##Not using this global land cover map because we found one Africa.
+# G = raster("Globcover2009_V2.3_Global_/GLOBCOVER_L4_200901_200912_V2.3.tif")
+
+G = raster("esa_kenya.tif")
+
+projection(m)==projection(G)#check this is true
+
+GCrop <- raster::crop(G, m)
+
+dim(GCrop)
+#adapted from SO: https://stackoverflow.com/questions/37956422/resample-raster
+Nhr_rows <- dim(GCrop)[1] # resolution of high-res raster
+Nhr_cols <- dim(GCrop)[2] # resolution of high-res raster
+Nlr_rows <- Nhr_rows/10 # resolution of low-res raster
+Nlr_cols <- Nhr_cols/10 # resolution of low-res raster
+Nratio <- as.integer(Nhr_rows/Nlr_rows) # ratio of high to low resolutions, to nearest integer value for aggregation
+
+# create some rasters
+r.hr <- raster(ncols=Nhr_cols, nrows=Nhr_rows)
+r.lr <- raster(ncols=Nlr_cols, nrows=Nlr_rows)
+#don't think next row is needed, think it is holdover from debugging
+# r.hr[] <- sample(1:13, Nhr^2, replace=T)
+r.hr<- GCrop
+
+# aggregate high res raster to *almost* the same resolution as the low res one (to nearest integer number of cells)
+# each resulting layerN contains the fraction of area within that cell in which value of original raster is N. 
+layer1 <- raster::aggregate(r.hr, Nratio, fun=function(x, na.rm=T) {mean(x==1, na.rm=na.rm)})
+layer2 <- raster::aggregate(r.hr, Nratio, fun=function(x, na.rm=T) {mean(x==2, na.rm=na.rm)})
+layer3 <- raster::aggregate(r.hr, Nratio, fun=function(x, na.rm=T) {mean(x==3, na.rm=na.rm)})
+layer4 <- raster::aggregate(r.hr, Nratio, fun=function(x, na.rm=T) {mean(x==4, na.rm=na.rm)})
+layer5 <- raster::aggregate(r.hr, Nratio, fun=function(x, na.rm=T) {mean(x==5, na.rm=na.rm)})
+layer6 <- raster::aggregate(r.hr, Nratio, fun=function(x, na.rm=T) {mean(x==6, na.rm=na.rm)})
+layer7 <- raster::aggregate(r.hr, Nratio, fun=function(x, na.rm=T) {mean(x==7, na.rm=na.rm)})
+layer8 <- raster::aggregate(r.hr, Nratio, fun=function(x, na.rm=T) {mean(x==8, na.rm=na.rm)})
+layer10 <- raster::aggregate(r.hr, Nratio, fun=function(x, na.rm=T) {mean(x==10, na.rm=na.rm)})
+
+# and resample low res raster to the desired resolution
+layer1 <- raster::resample(layer1, r.lr, method = "ngb") # Note you may prefer method = 'bilinear', depending on purpose.
+layer2 <- raster::resample(layer2, r.lr, method = "ngb")
+layer3 <- raster::resample(layer3, r.lr, method = "ngb")
+layer4 <- raster::resample(layer4, r.lr, method = "ngb")
+layer5 <- raster::resample(layer5, r.lr, method = "ngb")
+layer6 <- raster::resample(layer6, r.lr, method = "ngb")
+layer7 <- raster::resample(layer7, r.lr, method = "ngb")
+layer8 <- raster::resample(layer8, r.lr, method = "ngb")
+layer10 <- raster::resample(layer10, r.lr, method = "bilinear")
+
+layer_all = stack(layer1,layer2,
+                  layer3,
+                  layer4,
+                  layer5,
+                  layer6,
+                  layer7,
+                  layer8,
+                  layer10)
+
+
+#resample m (woody biomass) so  it as at same spatial scale as coarser-scaled layer_all (esa) 
+
+Nhr_rows <- dim(m)[1] # resolution of high-res raster
+Nhr_cols <- dim(m)[2] # resolution of high-res raster
+Nlr_rows <- dim(layer1)[1] # resolution of low-res raster
+Nlr_cols <- dim(layer1)[2] # resolution of low-res raster
+# Nratio <- as.integer(Nhr_rows/Nlr_rows) # ratio of high to low resolutions, to nearest integer value for aggregation
+Nratio <- Nhr_rows/Nlr_rows # ratio of high to low resolutions, to nearest integer value for aggregation
+
+r.hr <- raster(ncols=Nhr_cols, nrows=Nhr_rows)
+r.lr <- raster(ncols=Nlr_cols, nrows=Nlr_rows)
+r.hr<- m
+
+# each resulting layerN contains the fraction of area within that cell in which value of original raster is N. 
+layerm <- raster::aggregate(r.hr, Nratio, fun=function(x, na.rm=T) {mean(x, na.rm=na.rm)})
+
+layer_all_resample <- raster::resample(layer_all, layerm, method = "bilinear")
+
+# m_res = resample(layerm,layer1, method = "bilinear")
+
+#add the two layers
+r_comb = addLayer(layer_all_resample,layerm)
+
+#save combined layers 
+# writeRaster(r_comb, "r_comb.grd", format="raster",
+#             overwrite = TRUE)
+
+outfile <- writeRaster(r_comb, filename='r_comb.tif', format="GTiff", overwrite=TRUE,options=c("INTERLEAVE=BAND","COMPRESS=LZW"))
+
+```
+
+####Livestock
+Read in cattle, sheep, and goat data and combine
+```{r livestock}
+#source for cattle data: http://www.fao.org/geonetwork/srv/en/metadata.show?id=47949&currTab=simple
+r_comb = stack("r_comb.tif")
+
+C = raster("AFCattle1km_AD_2010_GLW2_01_TIF/AF_Cattle1km_AD_2010_v2_1.tif")
+#assign projection
+projection(C)=projection(r_comb)#check this is true
+
+#crop
+CCrop <- raster::crop(C, r_comb)
+
+#resample C (cattle) so  it as at same spatial scale as finer-scaled r_comb
+C_res = resample(CCrop,r_comb, method = "ngb")
+
+#add the two layers
+r_comb = addLayer(r_comb,C_res)
+
+S = raster("AF_Sheep1km_AD_2010_GLW2_1_TIF/AF_Sheep1km_AD_2010_v2_1.tif")
+projection(S)=projection(r_comb)#check this is true
+
+#crop
+SCrop <- raster::crop(S, r_comb)
+
+#resample C (cattle) so  it as at same spatial scale as finer-scaled r_comb
+S_res = resample(SCrop,r_comb, method = "ngb")
+
+#add the layer
+r_comb = addLayer(r_comb,S_res)
+
+#goats
+G = raster("AFGoats1km_AD_2010_v2_1_TIF/AF_Goats1km_AD_2010_v2_1.tif")
+projection(G)=projection(r_comb)#check this is true
+
+#crop
+GCrop <- raster::crop(G, r_comb)
+
+#resample C (cattle) so  it as at same spatial scale as finer-scaled r_comb
+G_res = resample(GCrop,r_comb, method = "ngb")
+
+#add the layer
+r_comb = addLayer(r_comb,G_res)
+
+outfile <- writeRaster(r_comb, filename='r_comb1.tif', format="GTiff", overwrite=TRUE,options=c("INTERLEAVE=BAND","COMPRESS=LZW"))
+
+```
+
 ###Assign environmental data to true and false Grevy's zebra locations. 
+
+load zebra data and environmental data and extract values 
+```{r assign_env}
+load("out.Rdata")
+out$hour = hour(out$timestamp)
+out$month = month(out$timestamp)
+out$year = year(out$timestamp)
+
+r_comb_in = stack("r_comb1.tif")
+
+out_spdf = SpatialPointsDataFrame(coords = out[,c("location-long", "location-lat")], 
+                               data = out)
+
+ # tell R that out coordinates are in the same lat/lon reference system
+# as the woody biomass and land cover 
+projection(out_spdf) <- projection(r_comb_in)
+locs.vals = raster::extract(r_comb_in, out_spdf,
+                            df = TRUE)#specify 
+
+locs.vals.df = data.frame(locs.vals)
+locs.vals.df$row = seq(1, dim(locs.vals.df)[1])
+
+#read in legend for GlobCover and add field with description in words
+# G_legend = read.csv("/Users/fischhoff/outside_analytics/sdm/Globcover2009_V2.3_Global_/Globcover2009_Legend.csv")
+
+G_legend = read.csv("ESACCI-LC_S2_Prototype_ColorLegend.csv")
+
+####################
+##changed this to work for ESA
+#names(G_legend)[names(G_legend)=="NB_LAB"]="GLOBCOVER_L4_200901_200912_V2.3"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.1"]="Tree.cover.areas"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.2"]="Shrubs.cover.areas"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.3"]="Grassland"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.4"]="Cropland"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.5"]="Vegetation aquatic or regularly flooded"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.6"]="Lichens Mosses / Sparse vegetation"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.7"]="Bare areas"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.8"]="Built up areas"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.9"]="Open water"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.10"]="woody.biomass"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.11"]="cattle"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.12"]="sheep"
+names(locs.vals.df)[names(locs.vals.df)=="r_comb1.13"]="goats"
+# encoder <- onehot(locs.vals.df.l, stringsAsFactors=FALSE, 
+#                   max_levels = length(unique(locs.vals.df.l$GLOBCOVER)))
+
+####################
+# locs.vals.df2 <- predict(encoder, locs.vals.df.l)
+# locs.vals.df3 = as.data.frame(locs.vals.df2)
+
+out$row = seq(1, dim(out)[1])
+
+out = merge(out, locs.vals.df, by = "row")
+
+out$case.numeric = as.numeric(out$case_)
+summary(out)
+
+out = out[,c(1:14,20:24)]#remove columns that are land covers not observed
+
+out_env = out
+save(out_env, file = "out_env.Rdata")
+```
+
 
 ##Analysis
 ###Define generalized boosted model to predict true vs. false. 
