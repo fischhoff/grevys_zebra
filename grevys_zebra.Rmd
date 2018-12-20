@@ -40,7 +40,7 @@ pkgTest <- function(x)
 }
 neededPackages <- c("raster", "rgdal", "dplyr", "lubridate", "ggplot2",  "geojsonio", 
                     "tmaptools", "geojson", "stplanr", "sf", "tidyverse", "amt", "tibble", "survival", "sp", "lubridate" ,
-                    "MuMIn", "lme4", "gamm4", "lmerTest", "ggplot2", "onehot", "scales")
+                    "MuMIn", "lme4", "gamm4", "lmerTest", "ggplot2", "onehot", "scales", "caret")
 
 for (package in neededPackages){pkgTest(package)}
 
@@ -678,7 +678,10 @@ G_res = resample(GCrop,r_comb, method = "ngb")
 r_comb = addLayer(r_comb,G_res)
 
 outfile <- writeRaster(r_comb, filename='r_comb1.tif', format="GTiff", overwrite=TRUE,options=c("INTERLEAVE=BAND","COMPRESS=LZW"))
-
+test0 = stack("r_comb.tif")
+dim(test0)
+test = stack("r_comb1.tif")
+dim(test)
 ```
 
 ###Assign environmental data to true and false Grevy's zebra locations. 
@@ -734,12 +737,13 @@ names(locs.vals.df)[names(locs.vals.df)=="r_comb1.13"]="goats"
 
 out$row = seq(1, dim(out)[1])
 
+dim(out)
 out = merge(out, locs.vals.df, by = "row")
-
+dim(out)
 out$case.numeric = as.numeric(out$case_)
 summary(out)
 
-out = out[,c(1:14,20:24)]#remove columns that are land covers not observed
+out = out[,c(1:17,22:27)]#remove columns that are land covers not observed
 
 out_env = out
 save(out_env, file = "out_env.Rdata")
@@ -747,7 +751,16 @@ save(out_env, file = "out_env.Rdata")
 
 
 ##Analysis
-###Define generalized boosted model to predict true vs. false. 
+###Define generalized boosted model to predict true vs. false location. 
+Define formula. 
+```{r}
+source("gbm_formula.R")
+```
+
 ###Split Grevy's zebra data into training and test sets
+```{r}
+source("split.R")
+```
+
 ###Fit model and determine training and test accuracy. 
 ###Predict habitat suitability across landscape by applying fitted model to map of environmental features.  
